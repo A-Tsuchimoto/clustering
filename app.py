@@ -142,6 +142,61 @@ def make_plotly_figure(plot_df: pd.DataFrame, cluster_keywords: dict[int, str]):
     return fig
 
 
+def summarize_top_frequency_by_cluster(
+    df_with_cluster: pd.DataFrame,
+    target_cols: list[str],
+    top_n: int = 5,
+) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    for cluster_id in sorted(df_with_cluster["_cluster"].unique()):
+        cluster_part = df_with_cluster[df_with_cluster["_cluster"] == cluster_id]
+        cluster_label = "Noise (-1)" if cluster_id == -1 else f"Cluster {int(cluster_id)}"
+        for col in target_cols:
+            values = (
+                cluster_part[col]
+                .fillna("(欠損)")
+                .astype(str)
+                .str.strip()
+                .replace("", "(空文字)")
+            )
+            top = values.value_counts().head(top_n)
+            for rank, (value, count) in enumerate(top.items(), start=1):
+                rows.append(
+                    {
+                        "cluster": cluster_label,
+                        "列名": col,
+                        "順位": rank,
+                        "値": value,
+                        "件数": int(count),
+                    }
+                )
+    return pd.DataFrame(rows)
+
+
+def build_yearly_trend(
+    df_with_cluster: pd.DataFrame,
+    date_col: str,
+) -> tuple[pd.DataFrame, int]:
+    date_series = df_with_cluster[date_col]
+    parsed_dt = pd.to_datetime(date_series, errors="coerce")
+
+    if parsed_dt.notna().sum() == 0:
+        year_from_digits = pd.to_numeric(
+            date_series.astype(str).str.extract(r"(\d{4})", expand=False),
+            errors="coerce",
+        )
+        years = year_from_digits
+    else:
+        years = parsed_dt.dt.year
+
+    valid = years.notna()
+    trend_df = df_with_cluster.loc[valid, ["_cluster"]].copy()
+    trend_df["year"] = years.loc[valid].astype(int)
+    trend_df["cluster_str"] = trend_df["_cluster"].map(lambda x: "Noise (-1)" if x == -1 else f"Cluster {x}")
+    agg_df = trend_df.groupby(["year", "cluster_str"], as_index=False).size().rename(columns={"size": "件数"})
+    return agg_df.sort_values(["year", "cluster_str"]).reset_index(drop=True), int(valid.sum())
+
+
 def evaluate_dbscan_labels(features: np.ndarray, labels: np.ndarray) -> tuple[float, float]:
     noise_rate = float((labels == -1).mean())
     valid_for_score = labels != -1
@@ -434,3 +489,57 @@ st.download_button(
     file_name="cluster_map.html",
     mime="text/html",
 )
+
+st.divider()
+st.subheader("4) 出願人分析（クラスター別 頻度ベスト5）")
+applicant_candidate_cols = list(work_df.columns)
+default_applicant_cols = [c for c in applicant_candidate_cols if any(k in c.lower() for k in ["applicant", "assignee"])]
+if not default_applicant_cols and applicant_candidate_cols:
+    default_applicant_cols = applicant_candidate_cols[:1]
+
+applicant_cols = st.multiselect(
+    "出願人情報に紐づく列（複数可）",
+    options=applicant_candidate_cols,
+    default=default_applicant_cols,
+)
+
+if applicant_cols:
+    cluster_ready_df = out_df.copy()
+    freq_df = summarize_top_frequency_by_cluster(cluster_ready_df, applicant_cols, top_n=5)
+    if freq_df.empty:
+        st.info("集計可能なデータがありません。")
+    else:
+        st.dataframe(freq_df, use_container_width=True, hide_index=True)
+else:
+    st.info("出願人分析を行うには、対象列を1つ以上選択してください。")
+
+st.divider()
+st.subheader("5) 出願トレンド分析（年次 × クラスター積層棒グラフ）")
+date_candidate_cols = list(work_df.columns)
+date_like_default = [
+    c
+    for c in date_candidate_cols
+    if any(k in c.lower() for k in ["date", "year", "filing", "出願", "公開", "日付"])
+]
+default_date_col = date_like_default[0] if date_like_default else date_candidate_cols[0]
+selected_date_col = st.selectbox(
+    "出願日の情報に紐づく列",
+    options=date_candidate_cols,
+    index=date_candidate_cols.index(default_date_col),
+)
+
+trend_df, valid_date_count = build_yearly_trend(out_df, selected_date_col)
+if trend_df.empty:
+    st.warning("年を抽出できるデータがありませんでした。日付形式や対象列を確認してください。")
+else:
+    trend_fig = px.bar(
+        trend_df,
+        x="year",
+        y="件数",
+        color="cluster_str",
+        barmode="stack",
+        title=f"出願年ごとの件数推移（有効日付: {valid_date_count}件）",
+        labels={"year": "年", "cluster_str": "クラスタ"},
+    )
+    trend_fig.update_layout(legend_title_text="クラスタ")
+    st.plotly_chart(trend_fig, use_container_width=True)
